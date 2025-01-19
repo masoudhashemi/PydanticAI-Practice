@@ -7,6 +7,9 @@ from typing import Annotated, List
 from pydantic_ai import Agent
 from pydantic_ai.format_as_xml import format_as_xml
 from pydantic_graph import BaseNode, Edge, End, Graph, GraphRunContext, HistoryStep
+from tavily import TavilyClient
+import os
+from dotenv import load_dotenv
 
 
 @dataclass
@@ -14,6 +17,25 @@ class EvaluationResult:
     satisfactory: bool
     comment: str
     suggested_improvements: list[str]
+
+
+# Load environment variables and initialize Tavily client
+load_dotenv()
+tavily_client = TavilyClient()
+
+def format_sources(sources):
+    """
+    Formats a list of source dictionaries into a structured text for LLM input.
+    """
+    formatted_text = "Sources:\n\n"
+    for i, source in enumerate(sources, start=1):
+        formatted_text += (
+            f"Source {i}:\n"
+            f"Title: {source['title']}\n"
+            f"Url: {source['url']}\n"
+            f"Content: {source['content']}\n\n"
+        )
+    return formatted_text.strip()
 
 
 @dataclass
@@ -27,6 +49,7 @@ class ResearchState:
     agent_messages: list[dict] = field(default_factory=list)
     iteration_count: int = 0
     max_iterations: int = 3
+    sources: List[dict] = field(default_factory=list)  # Add sources field
 
 
 # Define agents with specific roles
@@ -38,11 +61,6 @@ question_generator = Agent(
     "openai:gpt-4o", result_type=List[str], system_prompt="Generate specific questions to research the topic."
 )
 
-search_agent = Agent(
-    "openai:gpt-4o",
-    result_type=str,
-    system_prompt="Simulate a search and provide relevant information for the question.",
-)
 
 followup_generator = Agent(
     "openai:gpt-4o", result_type=List[str], system_prompt="Generate follow-up questions based on the search results."
@@ -85,9 +103,22 @@ class GenerateQuestions(BaseNode[ResearchState]):
 class Search(BaseNode[ResearchState]):
     async def run(self, ctx: GraphRunContext[ResearchState]) -> GenerateFollowup:
         for question in ctx.state.questions:
-            result = await search_agent.run(question)
-            ctx.state.search_results[question] = result.data
-            print(f"\nSearching: {question}\nResults: {result.data[:200]}...")
+            # Use Tavily for real web search
+            search_results = tavily_client.search(
+                question, 
+                include_raw_content=False, 
+                max_results=2
+            )
+            
+            # Store the raw results and format them for the state
+            ctx.state.sources.extend(search_results["results"])
+            formatted_results = format_sources(search_results["results"])
+            ctx.state.search_results[question] = formatted_results
+            
+            print(f"\nSearching: {question}")
+            # Print first 200 chars of formatted results
+            print(f"Results: {formatted_results[:200]}...")
+            
         return GenerateFollowup()
 
 
@@ -110,21 +141,36 @@ class GenerateFollowup(BaseNode[ResearchState]):
 class SearchFollowup(BaseNode[ResearchState]):
     async def run(self, ctx: GraphRunContext[ResearchState]) -> Summarize:
         for question in ctx.state.followup_questions:
-            result = await search_agent.run(question)
-            ctx.state.search_results[question] = result.data
-            print(f"\nSearching followup: {question}\nResults: {result.data[:200]}...")
+            # Use Tavily for followup searches
+            search_results = tavily_client.search(
+                question, 
+                include_raw_content=False, 
+                max_results=2
+            )
+            
+            # Store the raw results and format them for the state
+            ctx.state.sources.extend(search_results["results"])
+            formatted_results = format_sources(search_results["results"])
+            ctx.state.search_results[question] = formatted_results
+            
+            print(f"\nSearching followup: {question}")
+            print(f"Results: {formatted_results[:200]}...")
+            
         return Summarize()
 
 
 @dataclass
 class Summarize(BaseNode[ResearchState]):
     async def run(self, ctx: GraphRunContext[ResearchState]) -> Evaluate:
+        # Include all sources in the summary prompt
+        all_sources = format_sources(ctx.state.sources)
         result = await summarize_agent.run(
             format_as_xml(
                 {
                     "research_question": ctx.state.research_question,
                     "plan": ctx.state.plan,
                     "search_results": ctx.state.search_results,
+                    "all_sources": all_sources,
                 }
             )
         )
