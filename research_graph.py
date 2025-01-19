@@ -10,6 +10,13 @@ from pydantic_graph import BaseNode, Edge, End, Graph, GraphRunContext, HistoryS
 
 
 @dataclass
+class EvaluationResult:
+    satisfactory: bool
+    comment: str
+    suggested_improvements: list[str]
+
+
+@dataclass
 class ResearchState:
     research_question: str
     plan: str | None = None
@@ -18,6 +25,8 @@ class ResearchState:
     followup_questions: List[str] = field(default_factory=list)
     summary: str | None = None
     agent_messages: list[dict] = field(default_factory=list)
+    iteration_count: int = 0
+    max_iterations: int = 3
 
 
 # Define agents with specific roles
@@ -41,6 +50,12 @@ followup_generator = Agent(
 
 summarize_agent = Agent(
     "openai:gpt-4o", result_type=str, system_prompt="Synthesize all research findings into a comprehensive summary."
+)
+
+evaluate_agent = Agent(
+    "openai:gpt-4o",
+    result_type=EvaluationResult,
+    system_prompt="Evaluate if the research results are satisfactory and suggest improvements if needed.",
 )
 
 
@@ -103,7 +118,7 @@ class SearchFollowup(BaseNode[ResearchState]):
 
 @dataclass
 class Summarize(BaseNode[ResearchState]):
-    async def run(self, ctx: GraphRunContext[ResearchState]) -> Annotated[End, Edge(label="complete")]:
+    async def run(self, ctx: GraphRunContext[ResearchState]) -> Evaluate:
         result = await summarize_agent.run(
             format_as_xml(
                 {
@@ -115,12 +130,47 @@ class Summarize(BaseNode[ResearchState]):
         )
         ctx.state.summary = result.data
         print(f"\nFinal Summary:\n{ctx.state.summary}")
-        return End(None)
+        return Evaluate()
+
+
+@dataclass
+class Evaluate(BaseNode[ResearchState]):
+    async def run(
+        self,
+        ctx: GraphRunContext[ResearchState],
+    ) -> Annotated[End, Edge(label="complete")] | GenerateQuestions:
+        result = await evaluate_agent.run(
+            format_as_xml(
+                {
+                    "research_question": ctx.state.research_question,
+                    "summary": ctx.state.summary,
+                    "search_results": ctx.state.search_results,
+                }
+            )
+        )
+
+        ctx.state.iteration_count += 1
+        print(f"\nEvaluation (Iteration {ctx.state.iteration_count}/{ctx.state.max_iterations}):")
+        print(f"Comment: {result.data.comment}")
+
+        if result.data.satisfactory or ctx.state.iteration_count >= ctx.state.max_iterations:
+            if ctx.state.iteration_count >= ctx.state.max_iterations:
+                print("\nReached maximum iterations. Stopping research.")
+            return End(None)
+        else:
+            print("\nSuggested improvements:")
+            for improvement in result.data.suggested_improvements:
+                print(f"- {improvement}")
+            # Clear previous questions and results for new iteration
+            ctx.state.questions = []
+            ctx.state.followup_questions = []
+            ctx.state.search_results = {}
+            return GenerateQuestions()
 
 
 # Create the research graph
 research_graph = Graph(
-    nodes=(Plan, GenerateQuestions, Search, GenerateFollowup, SearchFollowup, Summarize),
+    nodes=(Plan, GenerateQuestions, Search, GenerateFollowup, SearchFollowup, Summarize, Evaluate),
     state_type=ResearchState,
     run_end_type=None,
 )
@@ -145,7 +195,8 @@ async def run_research(question: str, history_file: Path | None = None):
         history_data = research_graph.dump_history(history, indent=2)
         if isinstance(history_data, bytes):
             history_data = history_data.decode("utf-8")
-        history_file.write_text(history_data)
+        # Add encoding parameter to handle Unicode characters
+        history_file.write_text(history_data, encoding="utf-8")
 
     return state.summary
 
